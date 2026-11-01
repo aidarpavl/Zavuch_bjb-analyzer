@@ -466,10 +466,83 @@ def build_prompt(base_prompt: str, data: dict, calc: dict, quality_mode: str,
     return f"{base_prompt.strip()}\n\n{extra}\n\n{data_as_text(data, calc, quality_mode)}\n\n{SECTION_FORMAT}"
 
 
-def stream_claude(api_key: str, model: str, prompt: str):
+def clean_key(raw: str) -> str:
+    """Убирает пробелы, переносы, кавычки и приставку 'Bearer', которые часто попадают при копировании."""
+    k = (raw or "").strip().strip('"').strip("'").strip()
+    k = re.sub(r"^(bearer\s+|ANTHROPIC_API_KEY\s*=\s*)", "", k, flags=re.I).strip().strip('"').strip("'")
+    return re.sub(r"\s+", "", k)
+
+
+def key_problem(key: str) -> str:
+    """Возвращает текст проблемы с форматом ключа или '' если формат нормальный."""
+    if not key:
+        return "Ключ не введён."
+    if key.startswith("sk-ant-oat"):
+        return ("Это токен подписки Claude.ai/Claude Code (sk-ant-oat…), он не работает в API. "
+                "Нужен API-ключ, который начинается с sk-ant-api…, — создайте его на console.anthropic.com → API Keys.")
+    if key.startswith("sk-ant-admin"):
+        return "Это admin-ключ (sk-ant-admin…). Нужен обычный API-ключ sk-ant-api… с console.anthropic.com."
+    if key.startswith(("sk-proj-", "sk-")) and not key.startswith("sk-ant-"):
+        return "Похоже, это ключ OpenAI (sk-…). Для этого приложения нужен ключ Anthropic: sk-ant-api…"
+    if key.startswith("AIza"):
+        return "Похоже, это ключ Google Gemini. Для этого приложения нужен ключ Anthropic: sk-ant-api…"
+    if not key.startswith("sk-ant-"):
+        return "Ключ Anthropic должен начинаться с sk-ant-api… Проверьте, что скопирован весь ключ."
+    if len(key) < 60:
+        return "Ключ слишком короткий — похоже, скопирован не полностью."
+    return ""
+
+
+def make_client(api_key: str):
+    import os
     import anthropic
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # Если в окружении (или в Secrets Streamlit, которые тоже попадают в окружение) есть
+    # ANTHROPIC_AUTH_TOKEN, SDK отправит его как Bearer-токен — отсюда «Invalid bearer token».
+    for var in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+        os.environ.pop(var, None)
+    return anthropic.Anthropic(api_key=api_key, max_retries=2)
+
+
+def friendly_error(e: Exception) -> str:
+    import anthropic
+
+    status = getattr(e, "status_code", None)
+    msg = str(e)
+    if isinstance(e, anthropic.AuthenticationError) or status == 401:
+        return ("**Ключ не принят (401).** Проверьте:\n"
+                "- ключ начинается с `sk-ant-api…` и скопирован целиком, без пробелов и кавычек;\n"
+                "- ключ не удалён и не отключён на console.anthropic.com → API Keys (лучше создать новый);\n"
+                "- в Streamlit Cloud → Settings → Secrets строка выглядит точно так: "
+                "`ANTHROPIC_API_KEY = \"sk-ant-api…\"`, и нет строки `ANTHROPIC_AUTH_TOKEN`;\n"
+                "- после изменения Secrets приложение перезапущено (Reboot app).")
+    if isinstance(e, anthropic.PermissionDeniedError) or status == 403:
+        return "**Доступ запрещён (403).** У ключа нет доступа к этой модели или API недоступен в вашем регионе/организации."
+    if isinstance(e, anthropic.NotFoundError) or status == 404:
+        return "**Модель не найдена (404).** Выберите другую модель в боковой панели или укажите свою."
+    if isinstance(e, anthropic.RateLimitError) or status == 429:
+        return "**Слишком много запросов (429).** Подождите минуту и попробуйте снова."
+    if status == 400 and "credit" in msg.lower():
+        return ("**На счёте нет средств.** Пополните баланс на console.anthropic.com → Billing "
+                "(API оплачивается отдельно от подписки Claude Pro).")
+    if isinstance(e, anthropic.APIConnectionError):
+        return "**Нет соединения с API Anthropic.** Проверьте интернет и попробуйте ещё раз."
+    if status and status >= 500:
+        return f"**Сервер Anthropic временно недоступен ({status}).** Попробуйте через пару минут."
+    return f"**Ошибка ИИ:** {msg}"
+
+
+def test_key(api_key: str, model: str) -> tuple[bool, str]:
+    try:
+        make_client(api_key).messages.create(
+            model=model, max_tokens=5, messages=[{"role": "user", "content": "ok"}])
+        return True, "Ключ работает ✅"
+    except Exception as e:
+        return False, friendly_error(e)
+
+
+def stream_claude(api_key: str, model: str, prompt: str):
+    client = make_client(api_key)
     with client.messages.stream(
         model=model,
         max_tokens=16000,
@@ -801,15 +874,34 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ Настройки")
-        secret_key = get_api_key()
-        if secret_key:
-            st.success("API-ключ Anthropic подключён")
-            api_key = secret_key
+        secret_key = clean_key(get_api_key())
+        typed = st.text_input(
+            "API-ключ Anthropic", type="password",
+            placeholder="ключ из Secrets" if secret_key else "sk-ant-api…",
+            help="Создаётся на console.anthropic.com → API Keys. Если ключ сохранён в Secrets, "
+                 "поле можно не заполнять; введённый здесь ключ заменяет ключ из Secrets.")
+        api_key = clean_key(typed) or secret_key
+        source = "введён вручную" if clean_key(typed) else "из Secrets"
+        problem = key_problem(api_key) if api_key else ""
+        if not api_key:
+            st.caption("Без ключа будет только автоматический анализ, без советов ИИ.")
+        elif problem:
+            st.error(f"Ключ ({source}): {problem}")
         else:
-            api_key = st.text_input("API-ключ Anthropic", type="password",
-                                    help="Можно получить на console.anthropic.com. Без ключа будет только "
-                                         "автоматический анализ, без советов ИИ.")
-        model_label = st.selectbox("Модель ИИ", list(MODELS))
+            st.caption(f"Ключ {source}: `{api_key[:10]}…{api_key[-4:]}`")
+
+        model_label = st.selectbox("Модель ИИ", list(MODELS) + ["Своя модель…"])
+        if model_label == "Своя модель…":
+            model_id = st.text_input("ID модели", "claude-sonnet-5-5").strip()
+        else:
+            model_id = MODELS[model_label]
+
+        if api_key and st.button("🔑 Проверить ключ", use_container_width=True):
+            with st.spinner("Проверяю…"):
+                ok, msg = test_key(api_key, model_id)
+            (st.success if ok else st.error)(msg)
+        if problem:
+            api_key = ""  # не отправляем заведомо неверный ключ
         quality_mode = st.radio("Как считать сапа %", list(QUALITY_MODES), index=0,
                                 help="В разных школах формула разная. Выберите принятую у вас — "
                                      "программа сверит с ней числа в таблице.")
@@ -908,13 +1000,14 @@ def main():
         if st.button("🤖 Анализировать с ИИ", type="primary", disabled=not api_key):
             prompt = build_prompt(base_prompt, data, calc, quality_mode, topics, objectives, hard_tasks)
             try:
-                st.session_state["ai_md"] = st.write_stream(stream_claude(api_key, MODELS[model_label], prompt))
+                with st.spinner("ИИ анализирует данные… обычно 1–2 минуты"):
+                    st.session_state["ai_md"] = st.write_stream(stream_claude(api_key, model_id, prompt))
             except Exception as e:
-                st.error(f"Ошибка ИИ: {e}")
+                st.error(friendly_error(e))
         elif "ai_md" in st.session_state:
             st.markdown(st.session_state["ai_md"])
         if not api_key:
-            st.info("Введите API-ключ в боковой панели, чтобы получить анализ и советы ИИ. "
+            st.info("Введите правильный API-ключ Anthropic (sk-ant-api…) в боковой панели, чтобы получить анализ и советы ИИ. "
                     "Файлы можно скачать и без него — с автоматическим анализом.")
 
     # ── Скачивание
